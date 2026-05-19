@@ -1,8 +1,6 @@
 """
 Big Bets PPT 解析 API + MCP 协议支持
-支持两种调用方式：
-1. 普通 REST API: POST /parse
-2. MCP 协议: /mcp (SSE 流式传输)
+MCP 工具接收智能体从知识库读取的 PPT 文本内容，做精确字段提取
 """
 
 from flask import Flask, request, jsonify, Response
@@ -10,11 +8,10 @@ from pptx import Presentation
 from io import BytesIO
 import re
 import json
-import uuid
 
 app = Flask(__name__)
 
-# 需要提取的字段关键词（用于模糊匹配）
+# 需要提取的字段关键词
 FIELD_KEYWORDS = [
     "Key issues",
     "Insights to why",
@@ -38,108 +35,72 @@ BIG_BETS_NAMES = [
 ]
 
 
-def extract_all_text_from_slide(slide):
-    """提取一页幻灯片中所有文本框的全部文本，合并为一个文本池"""
-    all_texts = []
-    for shape in slide.shapes:
-        if shape.has_text_frame:
-            for paragraph in shape.text_frame.paragraphs:
-                text = paragraph.text.strip()
-                if text:
-                    all_texts.append(text)
-        if shape.has_table:
-            table = shape.table
-            for row in table.rows:
-                for cell in row.cells:
-                    text = cell.text.strip()
-                    if text:
-                        all_texts.append(text)
-    return all_texts
-
-
-def extract_title_info(all_texts):
-    """从文本池中提取 Big Bets 名称和 Owner"""
-    big_bet = ""
-    owner = ""
-
-    for text in all_texts:
-        for name in BIG_BETS_NAMES:
-            if name.lower() in text.lower():
-                big_bet = name
-                bbo_match = re.search(r'BBO\s+(.+)', text, re.IGNORECASE)
-                if bbo_match:
-                    owner = bbo_match.group(1).strip()
-                break
-        if big_bet:
-            break
-
-    return big_bet, owner
-
-
-def find_field_content(all_texts, field_keyword):
-    """在文本池中找到某个字段关键词，并提取其后续内容"""
-    start_index = -1
-    for i, text in enumerate(all_texts):
-        cleaned = text.lower().replace(":", "").replace("：", "").strip()
-        keyword_cleaned = field_keyword.lower().replace(":", "").strip()
-        if keyword_cleaned in cleaned:
-            start_index = i
-            break
-
-    if start_index == -1:
-        return ""
-
-    keyword_line = all_texts[start_index]
-    content_parts = []
-
-    after_keyword = re.split(r'[:：]', keyword_line, maxsplit=1)
-    if len(after_keyword) > 1 and after_keyword[1].strip():
-        content_parts.append(after_keyword[1].strip())
-
-    for i in range(start_index + 1, len(all_texts)):
-        text = all_texts[i]
-        is_next_field = False
-        for kw in FIELD_KEYWORDS:
-            cleaned = text.lower().replace(":", "").replace("：", "").strip()
-            kw_cleaned = kw.lower().replace(":", "").strip()
-            if kw_cleaned in cleaned and len(text) < len(kw) + 30:
-                is_next_field = True
-                break
-
-        if is_next_field:
-            break
-
-        content_parts.append(text)
-
-    return "\n".join(content_parts)
-
-
-def parse_ppt(file_bytes):
-    """解析整个 PPT，返回所有 Big Bets 的数据"""
-    prs = Presentation(BytesIO(file_bytes))
+def parse_text_content(text_content):
+    """
+    从文本内容中解析 Big Bets 信息。
+    智能体从知识库读取 PPT 后，把文本发过来，这里做精确的字段提取。
+    """
     results = []
 
-    for slide in prs.slides:
-        all_texts = extract_all_text_from_slide(slide)
+    # 按 Big Bet 名称分割文本
+    # 先找到每个 Big Bet 在文本中的位置
+    positions = []
+    for name in BIG_BETS_NAMES:
+        # 查找包含 Big Bet 名称和 BBO 的行
+        pattern = re.compile(
+            rf'({re.escape(name)})\s*[-–—]\s*BBO\s+(\w+)',
+            re.IGNORECASE
+        )
+        for match in pattern.finditer(text_content):
+            positions.append({
+                "name": name,
+                "owner": match.group(2),
+                "start": match.start()
+            })
 
-        if not all_texts:
-            continue
+    # 如果没找到标准格式，尝试更宽松的匹配
+    if not positions:
+        for name in BIG_BETS_NAMES:
+            pattern = re.compile(
+                rf'({re.escape(name)})',
+                re.IGNORECASE
+            )
+            for match in pattern.finditer(text_content):
+                # 检查附近是否有 BBO
+                context = text_content[match.start():match.start() + 200]
+                bbo_match = re.search(r'BBO\s+(\w+)', context, re.IGNORECASE)
+                owner = bbo_match.group(1) if bbo_match else ""
+                positions.append({
+                    "name": name,
+                    "owner": owner,
+                    "start": match.start()
+                })
+                break  # 只取第一个匹配
 
-        big_bet, owner = extract_title_info(all_texts)
+    # 按位置排序
+    positions.sort(key=lambda x: x["start"])
 
-        if not big_bet:
-            continue
+    # 为每个 Big Bet 提取对应的文本段
+    for i, pos in enumerate(positions):
+        # 确定这个 Big Bet 的文本范围
+        start = pos["start"]
+        end = positions[i + 1]["start"] if i + 1 < len(positions) else len(text_content)
+        section_text = text_content[start:end]
 
+        # 将文本按行分割
+        lines = [line.strip() for line in section_text.split('\n') if line.strip()]
+
+        # 提取各字段
         record = {
-            "Big Bets": big_bet,
-            "Big Bets Owner": owner,
-            "Key issues": find_field_content(all_texts, "Key issues"),
-            "Insights to why": find_field_content(all_texts, "Insights to why"),
-            "Objective": find_field_content(all_texts, "Objective"),
-            "Project Boundary": find_field_content(all_texts, "Project Boundary"),
-            "Project Scope": find_field_content(all_texts, "Project Scope"),
-            "Any Hypotheses": find_field_content(all_texts, "Any Hypotheses"),
-            "Expected output/Success": find_field_content(all_texts, "Expected output"),
+            "Big Bets": pos["name"],
+            "Big Bets Owner": pos["owner"],
+            "Key issues": extract_field_from_lines(lines, "Key issues"),
+            "Insights to why": extract_field_from_lines(lines, "Insights to why"),
+            "Objective": extract_field_from_lines(lines, "Objective"),
+            "Project Boundary": extract_field_from_lines(lines, "Project Boundary"),
+            "Project Scope": extract_field_from_lines(lines, "Project Scope"),
+            "Any Hypotheses": extract_field_from_lines(lines, "Any Hypotheses"),
+            "Expected output/Success": extract_field_from_lines(lines, "Expected output"),
         }
 
         results.append(record)
@@ -147,247 +108,274 @@ def parse_ppt(file_bytes):
     return results
 
 
-# ============ REST API 端点 ============
+def extract_field_from_lines(lines, field_keyword):
+    """从行列表中提取某个字段的内容"""
+    start_index = -1
+    keyword_lower = field_keyword.lower().replace(":", "").strip()
+
+    for i, line in enumerate(lines):
+        cleaned = line.lower().replace(":", "").replace("：", "").strip()
+        if keyword_lower in cleaned:
+            start_index = i
+            break
+
+    if start_index == -1:
+        return ""
+
+    content_parts = []
+
+    # 检查关键词行本身是否包含内容
+    keyword_line = lines[start_index]
+    after_keyword = re.split(r'[:：]', keyword_line, maxsplit=1)
+    if len(after_keyword) > 1 and after_keyword[1].strip():
+        content_parts.append(after_keyword[1].strip())
+
+    # 收集后续行直到下一个字段
+    for i in range(start_index + 1, len(lines)):
+        line = lines[i]
+        is_next_field = False
+        for kw in FIELD_KEYWORDS:
+            cleaned = line.lower().replace(":", "").replace("：", "").strip()
+            kw_cleaned = kw.lower().replace(":", "").strip()
+            if kw_cleaned in cleaned and len(line) < len(kw) + 50:
+                is_next_field = True
+                break
+        if is_next_field:
+            break
+        content_parts.append(line)
+
+    return "\n".join(content_parts)
+
+
+def parse_ppt(file_bytes):
+    """解析 PPT 二进制文件"""
+    prs = Presentation(BytesIO(file_bytes))
+    results = []
+
+    for slide in prs.slides:
+        all_texts = []
+        for shape in slide.shapes:
+            if shape.has_text_frame:
+                for paragraph in shape.text_frame.paragraphs:
+                    text = paragraph.text.strip()
+                    if text:
+                        all_texts.append(text)
+            if shape.has_table:
+                for row in shape.table.rows:
+                    for cell in row.cells:
+                        text = cell.text.strip()
+                        if text:
+                            all_texts.append(text)
+
+        if not all_texts:
+            continue
+
+        # 提取标题
+        big_bet = ""
+        owner = ""
+        for text in all_texts:
+            for name in BIG_BETS_NAMES:
+                if name.lower() in text.lower():
+                    big_bet = name
+                    bbo_match = re.search(r'BBO\s+(.+)', text, re.IGNORECASE)
+                    if bbo_match:
+                        owner = bbo_match.group(1).strip()
+                    break
+            if big_bet:
+                break
+
+        if not big_bet:
+            continue
+
+        def find_field(field_keyword):
+            start_index = -1
+            for i, text in enumerate(all_texts):
+                cleaned = text.lower().replace(":", "").replace("：", "").strip()
+                kw_cleaned = field_keyword.lower().replace(":", "").strip()
+                if kw_cleaned in cleaned:
+                    start_index = i
+                    break
+            if start_index == -1:
+                return ""
+            content_parts = []
+            keyword_line = all_texts[start_index]
+            after_keyword = re.split(r'[:：]', keyword_line, maxsplit=1)
+            if len(after_keyword) > 1 and after_keyword[1].strip():
+                content_parts.append(after_keyword[1].strip())
+            for i in range(start_index + 1, len(all_texts)):
+                text = all_texts[i]
+                is_next_field = False
+                for kw in FIELD_KEYWORDS:
+                    cleaned = text.lower().replace(":", "").replace("：", "").strip()
+                    kw_cleaned = kw.lower().replace(":", "").strip()
+                    if kw_cleaned in cleaned and len(text) < len(kw) + 30:
+                        is_next_field = True
+                        break
+                if is_next_field:
+                    break
+                content_parts.append(text)
+            return "\n".join(content_parts)
+
+        record = {
+            "Big Bets": big_bet,
+            "Big Bets Owner": owner,
+            "Key issues": find_field("Key issues"),
+            "Insights to why": find_field("Insights to why"),
+            "Objective": find_field("Objective"),
+            "Project Boundary": find_field("Project Boundary"),
+            "Project Scope": find_field("Project Scope"),
+            "Any Hypotheses": find_field("Any Hypotheses"),
+            "Expected output/Success": find_field("Expected output"),
+        }
+        results.append(record)
+
+    return results
+
+
+# ============ REST API ============
 
 @app.route("/parse", methods=["POST"])
 def parse_endpoint():
-    """普通 REST API：接收 PPT 文件，返回解析结果"""
     if "file" in request.files:
-        file = request.files["file"]
-        file_bytes = file.read()
+        file_bytes = request.files["file"].read()
     else:
         file_bytes = request.get_data()
-
     if not file_bytes:
         return jsonify({"error": "No file provided"}), 400
-
     try:
         results = parse_ppt(file_bytes)
-        return jsonify({
-            "success": True,
-            "count": len(results),
-            "data": results
-        })
+        return jsonify({"success": True, "count": len(results), "data": results})
     except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    """健康检查"""
     return jsonify({"status": "ok"})
 
 
-# ============ MCP 协议端点 ============
-
-# 存储 PPT 文件（内存中，由上传工具存入）
-ppt_storage = {}
-
+# ============ MCP 协议 ============
 
 def make_sse_message(event_type, data):
-    """构造 SSE 消息"""
     return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
 
 
 @app.route("/mcp", methods=["GET", "POST"])
 def mcp_endpoint():
-    """MCP SSE 端点"""
     if request.method == "GET":
-        # SSE 连接建立，返回 server info
         def generate():
-            # 发送 endpoint event
-            yield make_sse_message("endpoint", f"/mcp/messages")
+            yield make_sse_message("endpoint", "/mcp/messages")
         return Response(generate(), mimetype="text/event-stream",
                        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
 
-    # POST - 处理 JSON-RPC 消息
     msg = request.get_json()
     method = msg.get("method", "")
     msg_id = msg.get("id")
 
     if method == "initialize":
-        response = {
+        return jsonify({
             "jsonrpc": "2.0",
             "id": msg_id,
             "result": {
                 "protocolVersion": "2024-11-05",
-                "capabilities": {
-                    "tools": {"listChanged": False}
-                },
-                "serverInfo": {
-                    "name": "BigBets Parser",
-                    "version": "1.0.0"
-                }
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": "BigBets Parser", "version": "2.0.0"}
             }
-        }
-        return jsonify(response)
+        })
 
     elif method == "tools/list":
-        response = {
+        return jsonify({
             "jsonrpc": "2.0",
             "id": msg_id,
             "result": {
                 "tools": [
                     {
-                        "name": "parse_bigbets_ppt",
-                        "description": "解析Big Bets PPT文件，提取每页的Big Bet信息（名称、Owner、Key issues、Insights to why、Objective、Project Boundary、Project Scope、Any Hypotheses、Expected output/Success）。返回所有8个Big Bets的完整数据。",
+                        "name": "parse_bigbets_text",
+                        "description": "接收从PPT中读取的文本内容，精确提取每个Big Bet的9个字段（Big Bets、Big Bets Owner、Key issues、Insights to why、Objective、Project Boundary、Project Scope、Any Hypotheses、Expected output/Success）。请将PPT的完整文本内容作为text参数传入。",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
-                                "file_url": {
+                                "text": {
                                     "type": "string",
-                                    "description": "PPT文件的URL或base64编码内容"
-                                },
-                                "action": {
-                                    "type": "string",
-                                    "description": "操作类型：parse（解析PPT）",
-                                    "enum": ["parse"]
+                                    "description": "从PPT文件中读取的完整文本内容。包含所有页面的文字，每个Big Bet的标题格式为'Big Bet名称 – BBO 人名'。"
                                 }
                             },
-                            "required": ["action"]
-                        }
-                    },
-                    {
-                        "name": "get_parsed_data",
-                        "description": "获取最近一次解析的Big Bets数据。如果已经有解析结果缓存，直接返回。",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {
-                                "big_bet_name": {
-                                    "type": "string",
-                                    "description": "可选：指定获取某个Big Bet的数据。不填则返回全部。"
-                                }
-                            }
+                            "required": ["text"]
                         }
                     }
                 ]
             }
-        }
-        return jsonify(response)
+        })
 
     elif method == "tools/call":
         tool_name = msg.get("params", {}).get("name", "")
         arguments = msg.get("params", {}).get("arguments", {})
 
-        if tool_name == "parse_bigbets_ppt":
-            # 如果有缓存的 PPT 数据，直接解析
-            if "default" in ppt_storage:
-                try:
-                    results = parse_ppt(ppt_storage["default"])
-                    result_text = json.dumps(results, ensure_ascii=False, indent=2)
-                    response = {
-                        "jsonrpc": "2.0",
-                        "id": msg_id,
-                        "result": {
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": f"成功解析PPT，共提取 {len(results)} 个Big Bets:\n\n{result_text}"
-                                }
-                            ]
-                        }
-                    }
-                except Exception as e:
-                    response = {
-                        "jsonrpc": "2.0",
-                        "id": msg_id,
-                        "result": {
-                            "content": [{"type": "text", "text": f"解析失败: {str(e)}"}],
-                            "isError": True
-                        }
-                    }
-            else:
-                # 没有缓存，使用预置的解析结果
-                response = {
+        if tool_name == "parse_bigbets_text":
+            text_content = arguments.get("text", "")
+            if not text_content:
+                return jsonify({
                     "jsonrpc": "2.0",
                     "id": msg_id,
                     "result": {
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": "请先通过 /upload 端点上传PPT文件，或者直接调用 get_parsed_data 获取预缓存的数据。"
-                            }
-                        ]
+                        "content": [{"type": "text", "text": "错误：未提供文本内容。请从知识库中读取PPT的完整文本并传入text参数。"}]
                     }
-                }
-            return jsonify(response)
+                })
 
-        elif tool_name == "get_parsed_data":
-            big_bet_name = arguments.get("big_bet_name", "")
-            if "default" in ppt_storage:
-                results = parse_ppt(ppt_storage["default"])
-                if big_bet_name:
-                    results = [r for r in results if r["Big Bets"].lower() == big_bet_name.lower()]
+            try:
+                results = parse_text_content(text_content)
+                if not results:
+                    return jsonify({
+                        "jsonrpc": "2.0",
+                        "id": msg_id,
+                        "result": {
+                            "content": [{"type": "text", "text": "未能从文本中提取到Big Bets信息。请确保传入的是完整的PPT文本内容，包含标题格式'Big Bet名称 – BBO 人名'。"}]
+                        }
+                    })
+
                 result_text = json.dumps(results, ensure_ascii=False, indent=2)
-            else:
-                result_text = "暂无解析数据，请先上传PPT文件到 /upload 端点。"
-
-            response = {
-                "jsonrpc": "2.0",
-                "id": msg_id,
-                "result": {
-                    "content": [{"type": "text", "text": result_text}]
-                }
-            }
-            return jsonify(response)
+                return jsonify({
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "content": [{
+                            "type": "text",
+                            "text": f"成功提取 {len(results)} 个Big Bets的数据：\n\n{result_text}"
+                        }]
+                    }
+                })
+            except Exception as e:
+                return jsonify({
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "content": [{"type": "text", "text": f"解析失败: {str(e)}"}],
+                        "isError": True
+                    }
+                })
 
         else:
-            response = {
+            return jsonify({
                 "jsonrpc": "2.0",
                 "id": msg_id,
                 "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"}
-            }
-            return jsonify(response)
+            })
 
     elif method == "notifications/initialized":
         return "", 204
 
     else:
-        response = {
+        return jsonify({
             "jsonrpc": "2.0",
             "id": msg_id,
             "error": {"code": -32601, "message": f"Method not found: {method}"}
-        }
-        return jsonify(response)
+        })
 
 
 @app.route("/mcp/messages", methods=["POST"])
 def mcp_messages():
-    """MCP 消息处理端点（与 /mcp POST 相同逻辑）"""
     return mcp_endpoint()
-
-
-@app.route("/upload", methods=["POST"])
-def upload_ppt():
-    """上传 PPT 文件到服务器缓存"""
-    if "file" in request.files:
-        file = request.files["file"]
-        file_bytes = file.read()
-    else:
-        file_bytes = request.get_data()
-
-    if not file_bytes:
-        return jsonify({"error": "No file provided"}), 400
-
-    ppt_storage["default"] = file_bytes
-
-    # 立即解析并返回结果
-    try:
-        results = parse_ppt(file_bytes)
-        return jsonify({
-            "success": True,
-            "message": f"PPT已上传并解析，共 {len(results)} 个Big Bets",
-            "count": len(results),
-            "data": results
-        })
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
 
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
-
-# Force redeploy
