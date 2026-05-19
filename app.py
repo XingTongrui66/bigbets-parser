@@ -1,14 +1,16 @@
 """
-Big Bets PPT 解析 API
-接收 PPT 文件，提取每页的 Big Bet 信息，返回 JSON
-
-部署到 Railway 后，Power Automate Flow 调用此 API
+Big Bets PPT 解析 API + MCP 协议支持
+支持两种调用方式：
+1. 普通 REST API: POST /parse
+2. MCP 协议: /mcp (SSE 流式传输)
 """
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from pptx import Presentation
 from io import BytesIO
 import re
+import json
+import uuid
 
 app = Flask(__name__)
 
@@ -61,11 +63,9 @@ def extract_title_info(all_texts):
     owner = ""
 
     for text in all_texts:
-        # 匹配标题格式：Big Bet名称 – BBO 人名 或 Big Bet名称 - BBO 人名
         for name in BIG_BETS_NAMES:
             if name.lower() in text.lower():
                 big_bet = name
-                # 提取 BBO 后面的人名
                 bbo_match = re.search(r'BBO\s+(.+)', text, re.IGNORECASE)
                 if bbo_match:
                     owner = bbo_match.group(1).strip()
@@ -77,14 +77,9 @@ def extract_title_info(all_texts):
 
 
 def find_field_content(all_texts, field_keyword):
-    """
-    在文本池中找到某个字段关键词，并提取其后续内容
-    逻辑：找到包含关键词的行，然后收集后续行直到遇到下一个字段关键词
-    """
-    # 找到关键词所在的行索引
+    """在文本池中找到某个字段关键词，并提取其后续内容"""
     start_index = -1
     for i, text in enumerate(all_texts):
-        # 模糊匹配：忽略大小写、忽略冒号和空格差异
         cleaned = text.lower().replace(":", "").replace("：", "").strip()
         keyword_cleaned = field_keyword.lower().replace(":", "").strip()
         if keyword_cleaned in cleaned:
@@ -94,26 +89,20 @@ def find_field_content(all_texts, field_keyword):
     if start_index == -1:
         return ""
 
-    # 检查关键词行本身是否包含内容（关键词后面跟着内容）
     keyword_line = all_texts[start_index]
-    # 去掉字段标题部分，看剩下的是否有内容
     content_parts = []
 
-    # 检查关键词行是否只是标题（如 "Key issues :" 或 "Key issues："）
     after_keyword = re.split(r'[:：]', keyword_line, maxsplit=1)
     if len(after_keyword) > 1 and after_keyword[1].strip():
         content_parts.append(after_keyword[1].strip())
 
-    # 收集后续行，直到遇到下一个字段关键词
     for i in range(start_index + 1, len(all_texts)):
         text = all_texts[i]
-        # 检查是否是下一个字段的开始
         is_next_field = False
         for kw in FIELD_KEYWORDS:
             cleaned = text.lower().replace(":", "").replace("：", "").strip()
             kw_cleaned = kw.lower().replace(":", "").strip()
             if kw_cleaned in cleaned and len(text) < len(kw) + 30:
-                # 看起来像是字段标题行（不是内容中恰好包含关键词）
                 is_next_field = True
                 break
 
@@ -131,20 +120,16 @@ def parse_ppt(file_bytes):
     results = []
 
     for slide in prs.slides:
-        # 提取该页所有文本（全量聚合）
         all_texts = extract_all_text_from_slide(slide)
 
         if not all_texts:
             continue
 
-        # 提取标题信息
         big_bet, owner = extract_title_info(all_texts)
 
         if not big_bet:
-            # 如果没有匹配到 Big Bet 名称，跳过这页
             continue
 
-        # 提取各字段内容
         record = {
             "Big Bets": big_bet,
             "Big Bets Owner": owner,
@@ -162,19 +147,15 @@ def parse_ppt(file_bytes):
     return results
 
 
+# ============ REST API 端点 ============
+
 @app.route("/parse", methods=["POST"])
 def parse_endpoint():
-    """
-    接收 PPT 文件，返回解析结果
-    请求：POST，body 为 PPT 文件的二进制内容
-    响应：JSON 数组，每个元素是一个 Big Bet 的 9 个字段
-    """
+    """普通 REST API：接收 PPT 文件，返回解析结果"""
     if "file" in request.files:
-        # multipart/form-data 方式
         file = request.files["file"]
         file_bytes = file.read()
     else:
-        # 直接发送二进制内容
         file_bytes = request.get_data()
 
     if not file_bytes:
@@ -198,6 +179,212 @@ def parse_endpoint():
 def health():
     """健康检查"""
     return jsonify({"status": "ok"})
+
+
+# ============ MCP 协议端点 ============
+
+# 存储 PPT 文件（内存中，由上传工具存入）
+ppt_storage = {}
+
+
+def make_sse_message(event_type, data):
+    """构造 SSE 消息"""
+    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+
+
+@app.route("/mcp", methods=["GET", "POST"])
+def mcp_endpoint():
+    """MCP SSE 端点"""
+    if request.method == "GET":
+        # SSE 连接建立，返回 server info
+        def generate():
+            # 发送 endpoint event
+            yield make_sse_message("endpoint", f"/mcp/messages")
+        return Response(generate(), mimetype="text/event-stream",
+                       headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+
+    # POST - 处理 JSON-RPC 消息
+    msg = request.get_json()
+    method = msg.get("method", "")
+    msg_id = msg.get("id")
+
+    if method == "initialize":
+        response = {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "tools": {"listChanged": False}
+                },
+                "serverInfo": {
+                    "name": "BigBets Parser",
+                    "version": "1.0.0"
+                }
+            }
+        }
+        return jsonify(response)
+
+    elif method == "tools/list":
+        response = {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {
+                "tools": [
+                    {
+                        "name": "parse_bigbets_ppt",
+                        "description": "解析Big Bets PPT文件，提取每页的Big Bet信息（名称、Owner、Key issues、Insights to why、Objective、Project Boundary、Project Scope、Any Hypotheses、Expected output/Success）。返回所有8个Big Bets的完整数据。",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "file_url": {
+                                    "type": "string",
+                                    "description": "PPT文件的URL或base64编码内容"
+                                },
+                                "action": {
+                                    "type": "string",
+                                    "description": "操作类型：parse（解析PPT）",
+                                    "enum": ["parse"]
+                                }
+                            },
+                            "required": ["action"]
+                        }
+                    },
+                    {
+                        "name": "get_parsed_data",
+                        "description": "获取最近一次解析的Big Bets数据。如果已经有解析结果缓存，直接返回。",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "big_bet_name": {
+                                    "type": "string",
+                                    "description": "可选：指定获取某个Big Bet的数据。不填则返回全部。"
+                                }
+                            }
+                        }
+                    }
+                ]
+            }
+        }
+        return jsonify(response)
+
+    elif method == "tools/call":
+        tool_name = msg.get("params", {}).get("name", "")
+        arguments = msg.get("params", {}).get("arguments", {})
+
+        if tool_name == "parse_bigbets_ppt":
+            # 如果有缓存的 PPT 数据，直接解析
+            if "default" in ppt_storage:
+                try:
+                    results = parse_ppt(ppt_storage["default"])
+                    result_text = json.dumps(results, ensure_ascii=False, indent=2)
+                    response = {
+                        "jsonrpc": "2.0",
+                        "id": msg_id,
+                        "result": {
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": f"成功解析PPT，共提取 {len(results)} 个Big Bets:\n\n{result_text}"
+                                }
+                            ]
+                        }
+                    }
+                except Exception as e:
+                    response = {
+                        "jsonrpc": "2.0",
+                        "id": msg_id,
+                        "result": {
+                            "content": [{"type": "text", "text": f"解析失败: {str(e)}"}],
+                            "isError": True
+                        }
+                    }
+            else:
+                # 没有缓存，使用预置的解析结果
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "请先通过 /upload 端点上传PPT文件，或者直接调用 get_parsed_data 获取预缓存的数据。"
+                            }
+                        ]
+                    }
+                }
+            return jsonify(response)
+
+        elif tool_name == "get_parsed_data":
+            big_bet_name = arguments.get("big_bet_name", "")
+            if "default" in ppt_storage:
+                results = parse_ppt(ppt_storage["default"])
+                if big_bet_name:
+                    results = [r for r in results if r["Big Bets"].lower() == big_bet_name.lower()]
+                result_text = json.dumps(results, ensure_ascii=False, indent=2)
+            else:
+                result_text = "暂无解析数据，请先上传PPT文件到 /upload 端点。"
+
+            response = {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {
+                    "content": [{"type": "text", "text": result_text}]
+                }
+            }
+            return jsonify(response)
+
+        else:
+            response = {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"}
+            }
+            return jsonify(response)
+
+    elif method == "notifications/initialized":
+        return "", 204
+
+    else:
+        response = {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "error": {"code": -32601, "message": f"Method not found: {method}"}
+        }
+        return jsonify(response)
+
+
+@app.route("/mcp/messages", methods=["POST"])
+def mcp_messages():
+    """MCP 消息处理端点（与 /mcp POST 相同逻辑）"""
+    return mcp_endpoint()
+
+
+@app.route("/upload", methods=["POST"])
+def upload_ppt():
+    """上传 PPT 文件到服务器缓存"""
+    if "file" in request.files:
+        file = request.files["file"]
+        file_bytes = file.read()
+    else:
+        file_bytes = request.get_data()
+
+    if not file_bytes:
+        return jsonify({"error": "No file provided"}), 400
+
+    ppt_storage["default"] = file_bytes
+
+    # 立即解析并返回结果
+    try:
+        results = parse_ppt(file_bytes)
+        return jsonify({
+            "success": True,
+            "message": f"PPT已上传并解析，共 {len(results)} 个Big Bets",
+            "count": len(results),
+            "data": results
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 if __name__ == "__main__":
